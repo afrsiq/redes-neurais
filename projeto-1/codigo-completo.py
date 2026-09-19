@@ -208,6 +208,47 @@ ax2.set_ylabel('Resíduos ($y - \\hat{y}$)')
 ax2.legend()
 ax2.grid(True, alpha=0.3)
 
+# 1. Gerar um intervalo denso e contínuo de valores para X
+X_dense = np.linspace(X.min(), X.max(), 500).reshape(-1, 1)
+
+# 2. Padronizar com as mesmas estatísticas do treino
+X_dense_norm = (X_dense - mean_X) / std_X
+X_dense_tensor = torch.tensor(X_dense_norm, dtype=torch.float32)
+
+# 3. Gerar as predições contínuas do Baseline e do Melhor Modelo
+model_base, _, _ = train_model(use_momentum=False)
+model_best, _, _ = train_model(use_momentum=True, momentum_val=0.9)
+
+# Agora funciona normalmente!
+model_base.eval()
+model_best.eval()
+
+with torch.no_grad():
+    y_dense_base_norm = model_base(X_dense_tensor).numpy()
+    y_dense_best_norm = model_best(X_dense_tensor).numpy()
+
+# Despadronizar para a escala original do y
+y_dense_base = y_dense_base_norm * std_y + mean_y
+y_dense_best = y_dense_best_norm * std_y + mean_y
+
+plt.figure(figsize=(10, 6))
+
+# Dispersão dos dados
+plt.scatter(X_test, y_test, alpha=0.3, color='gray', label='Dados de Teste (80%)')
+plt.scatter(X_train, y_train, color='black', s=50, zorder=5, label='Dados de Treino (10%)')
+
+# Curvas ajustadas pelas redes neurais
+plt.plot(X_dense, y_dense_base, color='red', linestyle='--', linewidth=2, label='Curva Aprendida - Baseline (SGD)')
+plt.plot(X_dense, y_dense_best, color='blue', linewidth=2.5, label='Curva Aprendida - Melhor Modelo (Momentum)')
+
+plt.title('Ajuste da Curva Aprendida vs. Dados Reais')
+plt.xlabel('x')
+plt.ylabel('y')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
 plt.tight_layout()
 plt.savefig("parity_residuos.png")
 plt.show()
