@@ -14,7 +14,7 @@ SEED = 42
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
-df = pd.read_csv('C:/Users/anafl/Downloads/dataset_projeto1.csv')
+df = pd.read_csv('dataset_projeto1.csv')
 X = df[['x']].values
 y = df[['y']].values
 
@@ -63,6 +63,7 @@ train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
 val_loader   = DataLoader(val_dataset, batch_size=len(val_dataset), shuffle=False)
 test_loader  = DataLoader(test_dataset, batch_size=len(test_dataset), shuffle=False)
 
+# Arquitetura MLP
 class MLP(nn.Module):
     def __init__(self, input_dim=1, hidden_dim=64, output_dim=1, dropout_prob=0.0):
         super(MLP, self).__init__()
@@ -189,7 +190,7 @@ preds_best = results["Momentum"]["preds"]
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
 ax1.scatter(y_test, preds_base, alpha=0.5, color='gray', label='Baseline (SGD)')
-ax1.scatter(y_test, preds_best, alpha=0.7, color='blue', label='Melhor Modelo (Momentum)')
+ax1.scatter(y_test, preds_best, alpha=0.7, color='blue', label='Melhor Modelo (Momentum+Dropout)')
 min_val = min(y_test.min(), preds_base.min(), preds_best.min())
 max_val = max(y_test.max(), preds_base.max(), preds_best.max())
 ax1.plot([min_val, max_val], [min_val, max_val], 'r--', label='Ideal ($y = \\hat{y}$)')
@@ -202,24 +203,21 @@ ax1.grid(True, alpha=0.3)
 residuos = y_test - preds_best
 ax2.scatter(preds_best, residuos, alpha=0.7, color='green')
 ax2.axhline(0, color='red', linestyle='--', label='Resíduo Zero')
-ax2.set_title('Gráfico de Resíduos (Melhor Modelo - Momentum)')
+ax2.set_title('Gráfico de Resíduos (Melhor Modelo - Momentum+Dropout)')
 ax2.set_xlabel('Valores Preditos ($\\hat{y}$)')
 ax2.set_ylabel('Resíduos ($y - \\hat{y}$)')
 ax2.legend()
 ax2.grid(True, alpha=0.3)
 
-# 1. Gerar um intervalo denso e contínuo de valores para X
+# Grafico Comparativo Dados Reais vs. Ajusta da Curva Aprendida
 X_dense = np.linspace(X.min(), X.max(), 500).reshape(-1, 1)
 
-# 2. Padronizar com as mesmas estatísticas do treino
 X_dense_norm = (X_dense - mean_X) / std_X
 X_dense_tensor = torch.tensor(X_dense_norm, dtype=torch.float32)
 
-# 3. Gerar as predições contínuas do Baseline e do Melhor Modelo
 model_base, _, _ = train_model(use_momentum=False)
 model_best, _, _ = train_model(use_momentum=True, momentum_val=0.9)
 
-# Agora funciona normalmente!
 model_base.eval()
 model_best.eval()
 
@@ -227,19 +225,16 @@ with torch.no_grad():
     y_dense_base_norm = model_base(X_dense_tensor).numpy()
     y_dense_best_norm = model_best(X_dense_tensor).numpy()
 
-# Despadronizar para a escala original do y
 y_dense_base = y_dense_base_norm * std_y + mean_y
 y_dense_best = y_dense_best_norm * std_y + mean_y
 
 plt.figure(figsize=(10, 6))
 
-# Dispersão dos dados
 plt.scatter(X_test, y_test, alpha=0.3, color='gray', label='Dados de Teste (80%)')
 plt.scatter(X_train, y_train, color='black', s=50, zorder=5, label='Dados de Treino (10%)')
 
-# Curvas ajustadas pelas redes neurais
 plt.plot(X_dense, y_dense_base, color='red', linestyle='--', linewidth=2, label='Curva Aprendida - Baseline (SGD)')
-plt.plot(X_dense, y_dense_best, color='blue', linewidth=2.5, label='Curva Aprendida - Melhor Modelo (Momentum)')
+plt.plot(X_dense, y_dense_best, color='blue', linewidth=2.5, label='Curva Aprendida - Melhor Modelo (Momentum+Dropout)')
 
 plt.title('Ajuste da Curva Aprendida vs. Dados Reais')
 plt.xlabel('x')
