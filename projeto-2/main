@@ -1,0 +1,282 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from scipy.spatial.distance import cdist
+from sklearn.decomposition import PCA
+
+img_original = Image.open("imagem.jpg").convert("RGB")
+
+img_array = np.asarray(img_original)
+altura, largura, canais = img_array.shape
+
+X = img_array.reshape(-1, 3)
+
+X_norm = X / 255.0
+
+print(f"Dimensão da imagem: {altura}x{largura}")
+print(f"Conjunto de dados X_norm: {X_norm.shape} (N_pixels, 3)")
+
+class SOM:
+    def __init__(self, grid_h, grid_w, input_dim=3, lr=0.5, epochs=1000):
+        self.grid_h = grid_h
+        self.grid_w = grid_w
+        self.num_neurons = grid_h * grid_w
+        self.lr_initial = lr
+        self.epochs = epochs
+
+        # Inicializa os pesos dos neurônios com valores aleatórios no intervalo [0, 1]
+        self.weights = np.random.rand(self.num_neurons, input_dim)
+
+        # Gera as coordenadas bidimensionais (x, y) de cada neurônio na grade 2D
+        grid_y, grid_x = np.meshgrid(np.arange(grid_h), np.arange(grid_w), indexing="ij")
+        self.grid_coords = np.column_stack([grid_x.ravel(), grid_y.ravel()])
+
+        # Define o raio de vizinhança inicial com base no tamanho da grade
+        self.sigma_initial = max(grid_h, grid_w) / 2.0
+
+    def _find_bmu(self, x):
+        # cdist: Calcula a distância euclidiana entre a amostra x e todos os pesos dos neurônios
+        dists = np.linalg.norm(self.weights - x, axis=1)
+        return np.argmin(dists)
+
+    def fit(self, X):
+        num_samples = len(X)
+
+        for epoch in range(self.epochs):
+            # Decaimento exponencial dos hiperparâmetros (taxa de aprendizagem e raio)
+            lr = self.lr_initial * np.exp(-epoch / self.epochs)
+            sigma = self.sigma_initial * np.exp(-epoch / (self.epochs / np.log(self.sigma_initial + 1e-5)))
+
+            # Seleciona uma amostra aleatória a cada iteração
+            idx = np.random.randint(0, num_samples)
+            x = X[idx]
+
+            # Competição: Encontra a BMU
+            bmu_idx = self._find_bmu(x)
+            bmu_coord = self.grid_coords[bmu_idx]
+
+            # Cooperação: Calcula a distância topológica de todos os neurônios até a BMU na grade
+            dists_grid = np.sum((self.grid_coords - bmu_coord) ** 2, axis=1)
+            # Função de vizinhança Gaussiana
+            h = np.exp(-dists_grid / (2 * (sigma ** 2) + 1e-5))
+
+            # Adaptação: Atualiza os pesos do BMU e de seus vizinhos na grade
+            self.weights += lr * h[:, np.newaxis] * (x - self.weights)
+
+    def get_bmus(self, X):
+        # cdist calcula a matriz de distâncias de todos os pixels para todos os neurônios de uma vez
+        dists = cdist(X, self.weights, metric="euclidean")
+        return np.argmin(dists, axis=1)
+
+        class GNG:
+    def __init__(self, max_nodes=16, eb=0.01, en=0.0001, alpha=0.5, lmbda=50, a_max=90, epochs=1000):
+        self.max_nodes = max_nodes
+        self.eb = eb          # Taxa de aprendizado para a BMU (ηb = 10^-2)
+        self.en = en          # Taxa de aprendizado para os vizinhos conectados (ηn = 10^-4)
+        self.alpha = alpha    # Redução de erro após inserção/decaimento (α = 0.5)
+        self.lmbda = lmbda    # Intervalo de épocas/passos para adição de novos neurônios (λ = 50)
+        self.a_max = a_max    # Idade máxima da aresta antes de ser removida (amax = 90)
+        self.epochs = epochs
+
+    def fit(self, X):
+        # Inicialização com 2 neurônios em posições aleatórias
+        self.nodes = np.random.rand(2, X.shape[1])
+        self.edges = np.zeros((2, 2), dtype=bool)
+        self.ages = np.zeros((2, 2), dtype=int)
+        self.errors = np.zeros(2)
+
+        step = 0
+        total_steps = self.epochs * 100  # Passos de amostragem proporcional às épocas
+
+        for step in range(total_steps):
+            x = X[np.random.randint(0, len(X))]
+
+            # 1. Encontrar as duas BMUs mais próximas
+            dists = np.linalg.norm(self.nodes - x, axis=1)
+            bmu_1, bmu_2 = np.argsort(dists)[:2]
+
+            # 2. Atualizar erro da BMU principal
+            self.errors[bmu_1] += dists[bmu_1] ** 2
+
+            # 3. Mover a BMU1 e seus vizinhos conectados na rede de arestas
+            self.nodes[bmu_1] += self.eb * (x - self.nodes[bmu_1])
+            neighbors = np.where(self.edges[bmu_1])[0]
+            for n in neighbors:
+                self.nodes[n] += self.en * (x - self.nodes[n])
+                self.ages[bmu_1, n] += 1
+                self.ages[n, bmu_1] += 1
+
+            # 4. Criar ou zerar a idade da aresta entre BMU1 e BMU2
+            self.edges[bmu_1, bmu_2] = True
+            self.edges[bmu_2, bmu_1] = True
+            self.ages[bmu_1, bmu_2] = 0
+            self.ages[bmu_2, bmu_1] = 0
+
+            # 5. Remover arestas com idade superior a a_max
+            old_edges = self.ages > self.a_max
+            self.edges[old_edges] = False
+
+            # Remover nós que ficaram isolados sem nenhuma aresta (garantindo mínimo de 2 nós)
+            isolated = np.where(~self.edges.any(axis=1))[0]
+            if len(isolated) > 0 and len(self.nodes) - len(isolated) >= 2:
+                self._remove_nodes(isolated)
+
+            # 6. Inserir um novo nó a cada lmbda passos (se ainda não atingiu o limite max_nodes)
+            if step % self.lmbda == 0 and len(self.nodes) < self.max_nodes:
+                q = np.argmax(self.errors)               # Nó com maior erro acumulado
+                f = np.argmax(self.errors * self.edges[q]) # Vizinho de q com maior erro
+
+                # Novo nó inserido no ponto médio entre q e f
+                new_node = 0.5 * (self.nodes[q] + self.nodes[f])
+                self.nodes = np.vstack([self.nodes, new_node])
+
+                # Atualizar matrizes de arestas, idades e erros
+                num_n = len(self.nodes)
+                new_edges = np.zeros((num_n, num_n), dtype=bool)
+                new_edges[:-1, :-1] = self.edges
+                self.edges = new_edges
+
+                new_ages = np.zeros((num_n, num_n), dtype=int)
+                new_ages[:-1, :-1] = self.ages
+                self.ages = new_ages
+
+                # Reconectar arestas: remove entre q e f, conecta novo nó a q e f
+                self.edges[q, f] = False
+                self.edges[f, q] = False
+                new_idx = num_n - 1
+                self.edges[q, new_idx] = True
+                self.edges[new_idx, q] = True
+                self.edges[f, new_idx] = True
+                self.edges[new_idx, f] = True
+
+                # Ajustar erros acumulados
+                self.errors[q] *= self.alpha
+                self.errors[f] *= self.alpha
+                self.errors = np.append(self.errors, self.errors[q])
+
+            # Decaimento geral do erro de todos os nós
+            self.errors *= (1 - 0.0005)
+
+    def _remove_nodes(self, indices):
+        self.nodes = np.delete(self.nodes, indices, axis=0)
+        self.edges = np.delete(self.edges, indices, axis=0)
+        self.edges = np.delete(self.edges, indices, axis=1)
+        self.ages = np.delete(self.ages, indices, axis=0)
+        self.ages = np.delete(self.ages, indices, axis=1)
+        self.errors = np.delete(self.errors, indices, axis=0)
+
+    def get_bmus(self, X):
+        dists = cdist(X, self.nodes, metric="euclidean")
+        return np.argmin(dists, axis=1)
+
+        def calcular_erro_quantizacao(X, weights, bmus):
+    """
+    Calcula a média das distâncias euclidianas entre cada pixel e sua respectiva BMU.
+    """
+    dists = np.linalg.norm(X - weights[bmus], axis=1)
+    return np.mean(dists)
+
+def calcular_erro_topologico_som(X, som):
+    """
+    Proporção de amostras em que a 1ª e a 2ª BMUs não são vizinhas adjacentes na grade da SOM.
+    """
+    dists = cdist(X, som.weights, metric="euclidean")
+    sorted_bmus = np.argsort(dists, axis=1)
+
+    bmu1 = sorted_bmus[:, 0]
+    bmu2 = sorted_bmus[:, 1]
+
+    coords1 = som.grid_coords[bmu1]
+    coords2 = som.grid_coords[bmu2]
+
+    # Distância na grade topológica 2D
+    grid_dists = np.max(np.abs(coords1 - coords2), axis=1)
+    # Se a distância for > 1 na grade, há erro de topologia
+    erros = np.sum(grid_dists > 1)
+    return erros / len(X)
+
+    
+# Definimos 5 tamanhos de grids diferentes para gerar 5 imagens
+grids_som = [(2, 2), (4, 4), (8, 8), (12, 12), (16, 16)]
+
+# Subplots configurados para 5 linhas (1 para cada imagem/grid) e 3 colunas
+fig, axes = plt.subplots(len(grids_som), 3, figsize=(15, 20))
+
+for i, (gh, gw) in enumerate(grids_som):
+    som = SOM(grid_h=gh, grid_w=gw, epochs=1000)
+    som.fit(X_norm)
+
+    # Substituição dos pixels pelas cores da BMU
+    bmus = som.get_bmus(X_norm)
+    X_rec = som.weights[bmus]
+
+    # Reconstrução da imagem
+    img_rec = (X_rec.reshape(altura, largura, 3) * 255).astype(np.uint8)
+
+    # Cálculo das métricas
+    eq = calcular_erro_quantizacao(X_norm, som.weights, bmus)
+    et = calcular_erro_topologico_som(X_norm, som)
+
+    # Coluna 1: Imagem Quantizada
+    axes[i, 0].imshow(img_rec)
+    axes[i, 0].set_title(f"SOM {gh}x{gw} ({gh*gw} Cores)\nEQ: {eq:.4f} | ET: {et:.4f}")
+    axes[i, 0].axis("off")
+
+    # Coluna 2: Grid de Pesos RGB
+    weights_grid = som.weights.reshape(gh, gw, 3)
+    axes[i, 1].imshow(weights_grid)
+    axes[i, 1].set_title(f"Grid de Pesos RGB ({gh}x{gw})")
+    axes[i, 1].axis("off")
+
+plt.tight_layout()
+plt.show()
+
+nodes_gng = [8, 16, 32, 64, 256]
+
+# Subplots configurados em 1 linha com 5 colunas
+fig_gng, axes_gng = plt.subplots(1, len(nodes_gng), figsize=(20, 5))
+
+for i, n_nodes in enumerate(nodes_gng):
+    # Instanciação da GNG com os hiperparâmetros exigidos
+    gng = GNG(max_nodes=n_nodes, eb=1e-2, en=1e-4, alpha=0.5, lmbda=50, a_max=90, epochs=1000)
+    gng.fit(X_norm)
+
+    # Encontra BMUs e reconstrói a imagem
+    bmus_gng = gng.get_bmus(X_norm)
+    X_rec_gng = gng.nodes[bmus_gng]
+
+    img_rec_gng = (X_rec_gng.reshape(altura, largura, 3) * 255).astype(np.uint8)
+    eq_gng = calcular_erro_quantizacao(X_norm, gng.nodes, bmus_gng)
+
+    # Exibição da imagem reconstruída da GNG
+    axes_gng[i].imshow(img_rec_gng)
+    axes_gng[i].set_title(f"GNG ({len(gng.nodes)} Nós)\nEQ: {eq_gng:.4f}")
+    axes_gng[i].axis("off")
+
+plt.tight_layout()
+plt.show()
+
+fig_gng_deg, axes_gng_deg = plt.subplots(1, len(nodes_gng), figsize=(15, 3))
+
+for i, n_nodes in enumerate(nodes_gng):
+    gng = GNG(max_nodes=n_nodes, eb=1e-2, en=1e-4, alpha=0.5, lmbda=50, a_max=90, epochs=1000)
+    gng.fit(X_norm)
+    
+    # Reduz os pesos dos nós para 1D usando PCA para ordenar as cores suavemente
+    pca = PCA(n_components=1)
+    nodes_1d = pca.fit_transform(gng.nodes).ravel()
+    sorted_indices = np.argsort(nodes_1d)
+    
+    # Organiza os nós ordenados em uma matriz (1 linha com N colunas) simulando uma fita de degradê
+    sorted_nodes = gng.nodes[sorted_indices]
+    degradê_gng_array = sorted_nodes.reshape(1, len(sorted_nodes), 3)
+    
+    img_deg_gng = Image.fromarray((degradê_gng_array * 255).astype(np.uint8))
+    img_deg_gng = img_deg_gng.resize((300, 50), Image.NEAREST)
+    
+    axes_gng_deg[i].imshow(img_deg_gng)
+    axes_gng_deg[i].set_title(f"GNG ({len(gng.nodes)} Nós - Fita)")
+    axes_gng_deg[i].axis("off")
+
+plt.tight_layout()
+plt.show()
