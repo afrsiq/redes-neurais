@@ -1,1 +1,324 @@
+# Declaro que o código foi realizado com o auxílio da ferramente Claude
+!pip install -q "kagglehub[pandas-datasets]"
 
+import copy, time
+import numpy as np, pandas as pd
+import torch, torch.nn as nn, torch.nn.functional as F
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, normalized_mutual_info_score, adjusted_rand_score
+
+SEED = 42
+torch.manual_seed(SEED); np.random.seed(SEED)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", DEVICE)
+
+CLASSES = ["T-shirt/top", "Trouser", "Pullover", "Dress", "Coat",
+           "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot"]
+
+import kagglehub
+from kagglehub import KaggleDatasetAdapter
+
+df_train = kagglehub.load_dataset(KaggleDatasetAdapter.PANDAS, "zalando-research/fashionmnist", "fashion-mnist_train.csv")
+df_test  = kagglehub.load_dataset(KaggleDatasetAdapter.PANDAS, "zalando-research/fashionmnist", "fashion-mnist_test.csv")
+print(df_train.shape, df_test.shape)
+df_train.head()
+
+def to_tensor(df):
+    X = df.drop(columns="label").values.astype(np.float32) / 255.0   # pixels em [0, 1]
+    return torch.tensor(X).view(-1, 1, 28, 28), df["label"].values
+
+X_full, y_full = to_tensor(df_train)
+X_test, y_test = to_tensor(df_test)
+
+# 50k treino / 10k validação (o teste só é usado no final)
+perm = torch.randperm(len(X_full), generator=torch.Generator().manual_seed(SEED)).numpy()
+tr_idx, va_idx = perm[:50000], perm[50000:]
+X_train, y_train = X_full[tr_idx].to(DEVICE), y_full[tr_idx]
+X_val,   y_val   = X_full[va_idx].to(DEVICE), y_full[va_idx]
+X_test = X_test.to(DEVICE)
+print("treino:", X_train.shape, "| validação:", X_val.shape, "| teste:", X_test.shape)
+
+fig, axes = plt.subplots(2, 10, figsize=(15, 3.2))
+for c in range(10):
+    ex = X_train[np.where(y_train == c)[0][:2]].cpu()
+    for r in range(2):
+        axes[r, c].imshow(ex[r, 0], cmap="gray"); axes[r, c].axis("off")
+    axes[0, c].set_title(CLASSES[c], fontsize=8)
+plt.show()
+
+class MLPVAE(nn.Module):
+    def __init__(self, latent_dim, hidden=(512, 256)):
+        super().__init__()
+        dims = [784, *hidden]
+        enc = []
+        for a, b in zip(dims[:-1], dims[1:]): enc += [nn.Linear(a, b), nn.ReLU()]
+        self.enc = nn.Sequential(*enc)
+        self.fc_mu = nn.Linear(hidden[-1], latent_dim)
+        self.fc_logvar = nn.Linear(hidden[-1], latent_dim)
+        rdims = [latent_dim, *hidden[::-1]]
+        dec = []
+        for a, b in zip(rdims[:-1], rdims[1:]): dec += [nn.Linear(a, b), nn.ReLU()]
+        dec += [nn.Linear(hidden[0], 784)]
+        self.dec = nn.Sequential(*dec)
+
+    def encode(self, x):
+        h = self.enc(x.flatten(1))
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def decode(self, z):                 # retorna logits
+        return self.dec(z).view(-1, 1, 28, 28)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)   # reparametrização
+        return self.decode(z), mu, logvar
+
+
+class ConvVAE(nn.Module):
+    def __init__(self, latent_dim, channels=(32, 64)):
+        super().__init__()
+        c1, c2 = channels
+        self.c2 = c2
+        self.enc = nn.Sequential(
+            nn.Conv2d(1, c1, 4, 2, 1), nn.ReLU(),     # 28 -> 14
+            nn.Conv2d(c1, c2, 4, 2, 1), nn.ReLU(),    # 14 -> 7
+            nn.Flatten())
+        self.fc_mu = nn.Linear(c2 * 49, latent_dim)
+        self.fc_logvar = nn.Linear(c2 * 49, latent_dim)
+        self.fc_dec = nn.Linear(latent_dim, c2 * 49)
+        self.dec = nn.Sequential(
+            nn.ReLU(),
+            nn.ConvTranspose2d(c2, c1, 4, 2, 1), nn.ReLU(),   # 7 -> 14
+            nn.ConvTranspose2d(c1, 1, 4, 2, 1))               # 14 -> 28
+
+    def encode(self, x):
+        h = self.enc(x)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def decode(self, z):
+        return self.dec(self.fc_dec(z).view(-1, self.c2, 7, 7))
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
+        return self.decode(z), mu, logvar
+
+
+def build_model(cfg, latent_dim):
+    cls = MLPVAE if cfg["arch"] == "mlp" else ConvVAE
+    return cls(latent_dim, cfg["size"]).to(DEVICE)
+
+
+def vae_terms(logits, x, mu, logvar):
+    rec = F.binary_cross_entropy_with_logits(logits, x, reduction="none").flatten(1).sum(1)
+    kl_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())      # (B, D)
+    return rec.mean(), kl_dim.sum(1).mean(), kl_dim.mean(0)
+
+BS, MAX_EPOCHS, PATIENCE = 256, 40, 5     # reduza MAX_EPOCHS se o Colab estiver lento
+
+def run_epoch(model, X, opt=None, beta=1.0, bs=BS):
+    train = opt is not None
+    model.train(train)
+    idx = torch.randperm(len(X), device=DEVICE) if train else torch.arange(len(X), device=DEVICE)
+    tot, n = np.zeros(3), 0
+    with torch.set_grad_enabled(train):
+        for i in range(0, len(X), bs):
+            xb = X[idx[i:i + bs]]
+            logits, mu, logvar = model(xb)
+            rec, kl, _ = vae_terms(logits, xb, mu, logvar)
+            if train:
+                opt.zero_grad(); (rec + beta * kl).backward(); opt.step()
+            tot += np.array([(rec + kl).item(), rec.item(), kl.item()]) * len(xb); n += len(xb)
+    return tot / n          # [-ELBO, reconstrução, KL]
+
+
+def fit(model, lr, beta=1.0, max_epochs=MAX_EPOCHS, patience=PATIENCE):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    hist = {"train": [], "val": []}
+    best, best_state, bad, t0 = np.inf, None, 0, time.time()
+    for ep in range(max_epochs):
+        hist["train"].append(run_epoch(model, X_train, opt, beta))
+        hist["val"].append(run_epoch(model, X_val))
+        if hist["val"][-1][0] < best - 1e-3:
+            best, best_state, bad = hist["val"][-1][0], copy.deepcopy(model.state_dict()), 0
+        else:
+            bad += 1
+            if bad >= patience: break
+    model.load_state_dict(best_state)
+    hist["train"], hist["val"] = np.array(hist["train"]), np.array(hist["val"])
+    return hist, time.time() - t0
+
+
+# Espaço de busca (ajuste à vontade)
+ARCHS = [("mlp", (512, 256)), ("mlp", (1024, 512, 256)),
+         ("conv", (32, 64)),  ("conv", (64, 128))]
+LRS = [1e-3, 5e-4]
+configs = [dict(arch=a, size=s, lr=lr) for a, s in ARCHS for lr in LRS]
+
+results, best = [], {}
+for latent_dim in (2, 8):
+    for cfg in configs:
+        torch.manual_seed(SEED)
+        model = build_model(cfg, latent_dim)
+        hist, secs = fit(model, cfg["lr"])
+        va = run_epoch(model, X_val)
+        results.append(dict(latent=latent_dim, arch=cfg["arch"], size=str(cfg["size"]), lr=cfg["lr"],
+                            n_params=sum(p.numel() for p in model.parameters()),
+                            epochs=len(hist["val"]), val_loss=va[0], val_rec=va[1], val_kl=va[2],
+                            time_s=round(secs, 1)))
+        print(results[-1])
+        if latent_dim not in best or va[0] < best[latent_dim]["val_loss"]:
+            best[latent_dim] = dict(cfg=cfg, val_loss=va[0], hist=hist,
+                                    state=copy.deepcopy(model.state_dict()))
+
+df_res = pd.DataFrame(results).sort_values(["latent", "val_loss"]).reset_index(drop=True)
+df_res
+
+# Melhor configuração por dimensão latente
+models = {}
+for d in (2, 8):
+    m = build_model(best[d]["cfg"], d); m.load_state_dict(best[d]["state"]); m.eval()
+    models[d] = m
+    print(f"Latente {d}D -> {best[d]['cfg']} | val -ELBO = {best[d]['val_loss']:.2f}")
+
+@torch.no_grad()
+def get_mu(model, X, bs=2000):
+    model.eval()
+    return torch.cat([model.encode(X[i:i + bs])[0] for i in range(0, len(X), bs)]).cpu().numpy()
+
+@torch.no_grad()
+def get_mse(model, X, bs=2000):
+    out = []
+    for i in range(0, len(X), bs):
+        xb = X[i:i + bs]
+        out.append(F.mse_loss(torch.sigmoid(model.decode(model.encode(xb)[0])), xb, reduction="sum").item())
+    return sum(out) / (len(X) * 784)       # MSE por pixel, reconstrução determinística (usa μ)
+
+rows = []
+for d in (2, 8):
+    te = run_epoch(models[d], X_test)
+    rows.append(dict(latent=d, test_loss=te[0], test_rec=te[1], test_kl=te[2], test_mse_pixel=get_mse(models[d], X_test)))
+pd.DataFrame(rows)
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.8))
+for ax, d in zip(axes, (2, 8)):
+    h = best[d]["hist"]
+    ax.plot(h["train"][:, 0], label="treino"); ax.plot(h["val"][:, 0], label="validação")
+    ax.set_title(f"Curva de custo (-ELBO), latente {d}D"); ax.set_xlabel("época"); ax.set_ylabel("-ELBO"); ax.legend()
+plt.tight_layout(); plt.show()
+
+# Reconstrução e amostras geradas a partir do prior N(0, I)
+@torch.no_grad()
+def show_recon_and_samples(model, d, n=10):
+    model.eval()
+    x = X_test[:n]
+    rec = torch.sigmoid(model.decode(model.encode(x)[0])).cpu()
+    fig, axes = plt.subplots(2, n, figsize=(1.4 * n, 3))
+    for i in range(n):
+        axes[0, i].imshow(x[i, 0].cpu(), cmap="gray"); axes[0, i].axis("off")
+        axes[1, i].imshow(rec[i, 0], cmap="gray"); axes[1, i].axis("off")
+    axes[0, 0].set_title("original", fontsize=8, loc="left"); axes[1, 0].set_title("reconstrução", fontsize=8, loc="left")
+    plt.suptitle(f"Latente {d}D"); plt.show()
+
+    z = torch.randn(64, d, device=DEVICE)
+    s = torch.sigmoid(model.decode(z)).cpu()
+    grid = s.view(8, 8, 28, 28).permute(0, 2, 1, 3).reshape(8 * 28, 8 * 28)
+    plt.figure(figsize=(5, 5)); plt.imshow(grid, cmap="gray"); plt.axis("off")
+    plt.title(f"Amostras geradas (z ~ N(0, I)), latente {d}D"); plt.show()
+
+for d in (2, 8): show_recon_and_samples(models[d], d)
+
+Z_tr = {d: get_mu(models[d], X_train) for d in (2, 8)}
+Z_te = {d: get_mu(models[d], X_test) for d in (2, 8)}
+
+def scatter_labels(Z, y, title):
+    plt.figure(figsize=(7, 6))
+    sc = plt.scatter(Z[:, 0], Z[:, 1], c=y, cmap="tab10", s=4, alpha=0.7)
+    handles = [plt.Line2D([], [], marker="o", ls="", color=sc.cmap(sc.norm(c)), label=CLASSES[c]) for c in range(10)]
+    plt.legend(handles=handles, bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
+    plt.title(title); plt.tight_layout(); plt.show()
+
+# 2D direto
+scatter_labels(Z_te[2], y_test, "Espaço latente 2D (μ, conjunto de teste)")
+
+# 8D -> 2D via PCA
+pca = PCA(n_components=8).fit(Z_tr[8])
+evr = pca.explained_variance_ratio_
+P_tr, P_te = pca.transform(Z_tr[8])[:, :2], pca.transform(Z_te[8])[:, :2]
+scatter_labels(P_te, y_test, f"Latente 8D projetado com PCA (PC1+PC2 = {evr[:2].sum():.1%} da variância)")
+
+print("Variância explicada por componente:", np.round(evr, 4))
+print(f"PC1 + PC2: {evr[:2].sum():.2%}")
+plt.figure(figsize=(5, 3.2))
+plt.bar(range(1, 9), evr); plt.plot(range(1, 9), np.cumsum(evr), "o-", color="k")
+plt.xlabel("componente"); plt.ylabel("variância explicada"); plt.title("PCA do latente 8D"); plt.show()
+
+# Varredura do espaço latente 2D (decodifica uma grade de z)
+@torch.no_grad()
+def latent_manifold(model, n=15, lim=3.0):
+    g = np.linspace(-lim, lim, n)
+    zz = torch.tensor([[x, y] for y in g[::-1] for x in g], dtype=torch.float32, device=DEVICE)
+    imgs = torch.sigmoid(model.decode(zz)).cpu().view(n, n, 28, 28)
+    canvas = imgs.permute(0, 2, 1, 3).reshape(n * 28, n * 28)
+    plt.figure(figsize=(7, 7)); plt.imshow(canvas, cmap="gray", extent=[-lim, lim, -lim, lim])
+    plt.xlabel("z1"); plt.ylabel("z2"); plt.title("Varredura do espaço latente 2D"); plt.show()
+
+latent_manifold(models[2])
+
+# Métricas de separação de rótulos e de clusters
+def latent_metrics(Ztr, ytr, Zte, yte, name):
+    knn = KNeighborsClassifier(n_neighbors=5).fit(Ztr, ytr)
+    lr = LogisticRegression(max_iter=2000).fit(Ztr, ytr)
+    km = KMeans(n_clusters=10, n_init=10, random_state=SEED).fit(Zte)
+    return {"representação": name,
+            "kNN acc": knn.score(Zte, yte),
+            "LogReg acc": lr.score(Zte, yte),
+            "silhouette (rótulos)": silhouette_score(Zte, yte, sample_size=5000, random_state=SEED),
+            "NMI (KMeans k=10)": normalized_mutual_info_score(yte, km.labels_),
+            "ARI (KMeans k=10)": adjusted_rand_score(yte, km.labels_)}
+
+df_lat = pd.DataFrame([
+    latent_metrics(Z_tr[2], y_train, Z_te[2], y_test, "2D (direto)"),
+    latent_metrics(P_tr, y_train, P_te, y_test, "8D -> PCA 2D"),
+    latent_metrics(Z_tr[8], y_train, Z_te[8], y_test, "8D (completo)"),
+]).set_index("representação")
+df_lat.round(3)
+
+# Unidades ativas / posterior collapse: KL média por dimensão latente (no teste)
+@torch.no_grad()
+def kl_per_dim(model, X, bs=2000):
+    model.eval()
+    tot = 0
+    for i in range(0, len(X), bs):
+        xb = X[i:i + bs]
+        _, mu, logvar = model(xb)
+        tot = tot + vae_terms(model.decode(mu), xb, mu, logvar)[2] * len(xb)
+    return (tot / len(X)).cpu().numpy()
+
+for d in (2, 8):
+    k = kl_per_dim(models[d], X_test)
+    print(f"Latente {d}D: KL por dimensão = {np.round(k, 3)} | unidades ativas (KL > 0.01): {(k > 0.01).sum()}/{d}")
+
+BETAS = [0.5, 1.0, 4.0]
+rows, beta_models = [], {}
+for d in (2, 8):
+    for beta in BETAS:
+        torch.manual_seed(SEED)
+        m = build_model(best[d]["cfg"], d)
+        hist, secs = fit(m, best[d]["cfg"]["lr"], beta=beta)
+        va = run_epoch(m, X_val)
+        ztr, zte = get_mu(m, X_train), get_mu(m, X_test)
+        knn = KNeighborsClassifier(5).fit(ztr, y_train).score(zte, y_test)
+        rows.append(dict(latent=d, beta=beta, val_loss=va[0], val_rec=va[1], val_kl=va[2], kNN_acc=knn))
+        beta_models[(d, beta)] = m
+pd.DataFrame(rows).round(3)
+# Espaço latente 2D para cada β
+fig, axes = plt.subplots(1, len(BETAS), figsize=(5 * len(BETAS), 4.5))
+for ax, beta in zip(axes, BETAS):
+    Z = get_mu(beta_models[(2, beta)], X_test)
+    ax.scatter(Z[:, 0], Z[:, 1], c=y_test, cmap="tab10", s=3, alpha=0.7); ax.set_title(f"latente 2D, β = {beta}")
+plt.tight_layout(); plt.show()
