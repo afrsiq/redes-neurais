@@ -1,0 +1,207 @@
+!pip install yfinance tensorflow scikit-learn pandas matplotlib seaborn
+
+import itertools, time, os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import yfinance as yf
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks, optimizers
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+TICKER = "PETR4.SA"          # tente também: "IBM", "VALE3.SA", "ITUB4.SA"
+START, END = "2015-01-01", "2025-12-31"
+K = 5                        # horizonte de previsão (dias à frente)
+SPLIT = (0.70, 0.15, 0.15)   # treino / validação / teste (ordem cronológica)
+EPOCHS, BATCH, PATIENCE = 60, 32, 8
+GRID = {
+    "window":  [30, 60],
+    "units":   [32, 64, 128],
+    "layers":  [1, 2],
+    "dropout": [0.0, 0.2],
+    "lr":      [1e-3, 1e-2],
+}
+SEED = 42
+OUT = f"resultados_{TICKER.replace('.', '_')}"
+os.makedirs(OUT, exist_ok=True)
+tf.keras.utils.set_random_seed(SEED)
+
+df = yf.download(TICKER, start=START, end=END, auto_adjust=True, progress=False)
+if isinstance(df.columns, pd.MultiIndex):
+    df.columns = df.columns.get_level_values(0)
+close = df["Close"].dropna().values.reshape(-1, 1).astype("float32")
+dates = df["Close"].dropna().index
+N = len(close)
+cut1, cut2 = int(N * SPLIT[0]), int(N * (SPLIT[0] + SPLIT[1]))
+print(f"{TICKER}: {N} observações | treino {cut1} | val {cut2-cut1} | teste {N-cut2}")
+
+# Scaler ajustado SOMENTE no treino (evita vazamento de dados)
+scaler = MinMaxScaler().fit(close[:cut1])
+scaled = scaler.transform(close)
+
+def make_windows(series, W, k):
+    """X[i] = série[i:i+W]; y[i] = série[i+W-1+k]; tidx = índice do alvo."""
+    X, y, tidx = [], [], []
+    for i in range(len(series) - W - k + 1):
+        X.append(series[i:i + W])
+        y.append(series[i + W - 1 + k, 0])
+        tidx.append(i + W - 1 + k)
+    return np.array(X), np.array(y), np.array(tidx)
+
+
+def get_splits(W):
+    X, y, t = make_windows(scaled, W, K)
+    tr, va, te = t < cut1, (t >= cut1) & (t < cut2), t >= cut2
+    return (X[tr], y[tr], t[tr]), (X[va], y[va], t[va]), (X[te], y[te], t[te])
+
+    def build_model(kind, window, units, n_layers, dropout, lr):
+    Rnn = layers.LSTM if kind == "LSTM" else layers.GRU
+    m = models.Sequential([layers.Input((window, 1))])
+    for i in range(n_layers):
+        m.add(Rnn(units, return_sequences=(i < n_layers - 1)))
+        if dropout > 0:
+            m.add(layers.Dropout(dropout))
+    m.add(layers.Dense(1))
+    m.compile(optimizer=optimizers.Adam(lr), loss="mse")
+    return m
+
+
+def fit(m, tr, va, verbose=0):
+    es = callbacks.EarlyStopping(monitor="val_loss", patience=PATIENCE,
+                                 restore_best_weights=True)
+    return m.fit(tr[0], tr[1], validation_data=(va[0], va[1]),
+                 epochs=EPOCHS, batch_size=BATCH, callbacks=[es],
+                 verbose=verbose, shuffle=False)
+
+
+def inv(v):
+    return scaler.inverse_transform(np.asarray(v).reshape(-1, 1)).ravel()
+
+
+def metrics(y_true, y_pred):
+    return {
+        "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "MAPE(%)": np.mean(np.abs((y_true - y_pred) / y_true)) * 100,
+        "R2": r2_score(y_true, y_pred),
+    }
+
+    def grid_search(kind):
+    rows = []
+    keys = list(GRID)
+    combos = list(itertools.product(/*GRID.values()))
+    for n, vals in enumerate(combos, 1):
+        p = dict(zip(keys, vals))
+        tr, va, _ = get_splits(p["window"])
+        tf.keras.backend.clear_session()
+        tf.keras.utils.set_random_seed(SEED)
+        m = build_model(kind, p["window"], p["units"], p["layers"], p["dropout"], p["lr"])
+        h = fit(m, tr, va)
+        pred = inv(m.predict(va[0], verbose=0).ravel())
+        rmse = metrics(inv(va[1]), pred)["RMSE"]
+        rows.append({**p, "val_RMSE": rmse, "epochs": len(h.history["loss"]),
+                     "params": m.count_params()})
+        print(f"[{kind}] {n}/{len(combos)} {p} -> val RMSE {rmse:.3f}")
+    res = pd.DataFrame(rows).sort_values("val_RMSE").reset_index(drop=True)
+    res.to_csv(f"{OUT}/grid_{kind}.csv", index=False)
+    return res
+
+
+def heatmaps(res, kind):
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    for a, (r, c) in zip(ax, [("units", "lr"), ("layers", "dropout")]):
+        pv = res.pivot_table(index=r, columns=c, values="val_RMSE", aggfunc="min")
+        sns.heatmap(pv, annot=True, fmt=".2f", cmap="viridis_r", ax=a)
+        a.set_title(f"{kind}: RMSE de validação (mín.) – {r} x {c}")
+    plt.tight_layout()
+    plt.savefig(f"{OUT}/heatmap_{kind}.png", dpi=200)
+    plt.close()
+
+    results, preds, curves = [], {}, {}
+for kind in ["LSTM", "GRU"]:
+    res = grid_search(kind)
+    heatmaps(res, kind)
+    best = res.iloc[0]
+    W = int(best["window"])
+    print(f"\nMelhor {kind}:\n{best}\n")
+
+    tr, va, te = get_splits(W)
+    tf.keras.backend.clear_session()
+    tf.keras.utils.set_random_seed(SEED)
+    m = build_model(kind, W, int(best["units"]), int(best["layers"]),
+                    float(best["dropout"]), float(best["lr"]))
+    m.summary()  # tabela de arquitetura / nº de parâmetros (como na Tabela do artigo)
+    t0 = time.time()
+    h = fit(m, tr, va, verbose=1)
+    train_time = time.time() - t0
+    curves[kind] = h.history
+
+    out = {s: inv(m.predict(d[0], verbose=0).ravel()) for s, d in
+           zip(["train", "val", "test"], [tr, va, te])}
+    out["idx"] = {"train": tr[2], "val": va[2], "test": te[2]}
+    preds[kind] = out
+    for split, d in zip(["val", "test"], [va, te]):
+        results.append({"modelo": kind, "conjunto": split, **metrics(inv(d[1]), out[split]),
+                        "params": m.count_params(), "tempo_treino_s": round(train_time, 1),
+                        **{k: best[k] for k in ["window", "units", "layers", "dropout", "lr"]}})
+
+# Baseline ingênuo: preço(t+K) = preço(t)  (referência obrigatória em séries financeiras)
+_, va, te = get_splits(30)
+for split, d in zip(["val", "test"], [va, te]):
+    results.append({"modelo": "Naive", "conjunto": split,
+                    **metrics(inv(d[1]), inv(d[0][:, -1, 0]))})
+
+tab = pd.DataFrame(results)
+tab.to_csv(f"{OUT}/metricas.csv", index=False)
+print("\n", tab.round(3).to_string(index=False))
+
+# 1) Curvas de aprendizagem (treino x validação)
+fig, ax = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
+for a, kind in zip(ax, curves):
+    a.plot(curves[kind]["loss"], label="Treino")
+    a.plot(curves[kind]["val_loss"], label="Validação")
+    a.set_title(f"Curva de aprendizagem – {kind}")
+    a.set_xlabel("Época"); a.set_ylabel("MSE (escala normalizada)"); a.legend()
+plt.tight_layout(); plt.savefig(f"{OUT}/curvas_aprendizagem.png", dpi=200); plt.close()
+
+# 2) Série completa: treino / validação / teste previsto (estilo das figuras dos artigos)
+for kind in preds:
+    plt.figure(figsize=(11, 4.5))
+    plt.plot(dates, close.ravel(), color="lightgray", label="Real")
+    for split, c in zip(["train", "val", "test"], ["tab:orange", "tab:blue", "tab:green"]):
+        plt.plot(dates[preds[kind]["idx"][split]], preds[kind][split], color=c,
+                 lw=1, label=f"Previsto ({split})")
+    plt.title(f"{TICKER} ({kind}) – previsão em t+{K}")
+    plt.xlabel("Data"); plt.ylabel("Preço"); plt.legend()
+    plt.tight_layout(); plt.savefig(f"{OUT}/previsao_{kind}.png", dpi=200); plt.close()
+
+    # 3) Zoom no teste: real x LSTM x GRU
+plt.figure(figsize=(11, 4.5))
+idx = preds["LSTM"]["idx"]["test"]
+plt.plot(dates[idx], close[idx].ravel(), "k", label="Real")
+for kind, c in zip(preds, ["tab:red", "tab:green"]):
+    plt.plot(dates[preds[kind]["idx"]["test"]], preds[kind]["test"], color=c, label=kind)
+plt.title(f"{TICKER} – conjunto de teste (t+{K})"); plt.legend()
+plt.tight_layout(); plt.savefig(f"{OUT}/teste_comparacao.png", dpi=200); plt.close()
+
+# 4) Dispersão real x previsto + resíduos no teste
+fig, ax = plt.subplots(2, 2, figsize=(10, 8))
+for j, kind in enumerate(preds):
+    y_real = close[preds[kind]["idx"]["test"]].ravel()
+    y_hat = preds[kind]["test"]
+    ax[0, j].scatter(y_real, y_hat, s=6, alpha=.6)
+    lim = [y_real.min(), y_real.max()]
+    ax[0, j].plot(lim, lim, "r--"); ax[0, j].set_title(f"{kind}: real x previsto")
+    ax[1, j].hist(y_real - y_hat, bins=40); ax[1, j].set_title(f"{kind}: resíduos")
+plt.tight_layout(); plt.savefig(f"{OUT}/dispersao_residuos.png", dpi=200); plt.close()
+
+# 5) Heatmap comparativo de métricas (teste)
+mt = tab[tab.conjunto == "test"].set_index("modelo")[["RMSE", "MAE", "MAPE(%)", "R2"]]
+plt.figure(figsize=(6, 3))
+sns.heatmap(mt, annot=True, fmt=".3f", cmap="Blues")
+plt.title("Métricas no teste"); plt.tight_layout()
+plt.savefig(f"{OUT}/heatmap_metricas.png", dpi=200); plt.close()
+
+print(f"\nTudo salvo em ./{OUT}/")
